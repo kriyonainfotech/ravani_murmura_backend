@@ -47,6 +47,7 @@ const purchaseRow = (p) => {
   return {
     _id: p._id,
     billNo: p.purchaseId,
+    billNumber: p.billNumber || '',
     date: p.purchaseDate,
     partyName: p.supplier,
     partyMobile: p.partyMobileNumber || '',
@@ -75,7 +76,7 @@ const filterRows = (rows, { status, search }) => {
   }
   if (search) {
     const q = String(search).toLowerCase();
-    out = out.filter(r => [r.billNo, r.partyName, r.partyMobile, r.item].some(v => v && String(v).toLowerCase().includes(q)));
+    out = out.filter(r => [r.billNo, r.billNumber, r.partyName, r.partyMobile, r.item].some(v => v && String(v).toLowerCase().includes(q)));
   }
   return out;
 };

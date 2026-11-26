@@ -53,37 +53,60 @@ const syncPurchaseLoss = async (purchase, split) => {
   });
 };
 
-// Helper to create stock batch from purchase
+// Helper to create or update stock batch for a purchase (each purchase gets its own separate batch - NO averaging)
 const createStockBatch = async (purchase) => {
-  // Check if stock batch already exists for this purchase to prevent duplicates
-  const existingStock = await Stock.findOne({ purchaseId: purchase._id });
-  if (existingStock) return;
+  const prodName = (purchase.item || '').trim();
+  const incomingQty = purchase.receivedQuantity != null ? Number(purchase.receivedQuantity) : Number(purchase.quantity);
+  const incomingRate = Number(purchase.rate) || 0;
 
-  const lastStock = await Stock.findOne().sort({ batchId: -1 });
-  let nextNum = 1;
-  if (lastStock && lastStock.batchId && lastStock.batchId.startsWith('BATCH-')) {
-    const lastNum = parseInt(lastStock.batchId.replace('BATCH-', ''), 10);
-    if (!isNaN(lastNum)) {
-      nextNum = lastNum + 1;
-    }
+  // Check if stock already exists for THIS specific purchase
+  let stock = await Stock.findOne({ purchaseId: purchase._id });
+
+  if (stock) {
+    // Update existing batch for this purchase
+    const diff = incomingQty - (Number(stock.purchasedQuantity) || 0);
+    stock.purchasedQuantity = incomingQty;
+    stock.remainingQuantity = Math.max(0, (Number(stock.remainingQuantity) || 0) + diff);
+    stock.purchaseRate = incomingRate;
+    stock.productName = prodName;
+    stock.supplier = purchase.supplier;
+    stock.purchaseDate = purchase.purchaseDate;
+    if (purchase.costingUnit) stock.costingUnit = purchase.costingUnit;
+    stock.status = stock.remainingQuantity > 0 ? 'Available' : 'Consumed';
+
+    await stock.save();
+    return stock;
   }
+
+  // Generate unique BATCH-XXXX
+  const allStocks = await Stock.find({}, { batchId: 1 }).lean();
+  let maxNum = 0;
+  allStocks.forEach(s => {
+    if (s.batchId && s.batchId.startsWith('BATCH-')) {
+      const num = parseInt(s.batchId.replace('BATCH-', ''), 10);
+      if (!isNaN(num) && num > maxNum) maxNum = num;
+    }
+  });
+  const nextNum = maxNum + 1;
   const batchId = `BATCH-${nextNum.toString().padStart(4, '0')}`;
 
   const newStock = new Stock({
     batchId,
     purchaseId: purchase._id,
-    productName: purchase.item,
+    productName: prodName,
     supplier: purchase.supplier,
     purchaseDate: purchase.purchaseDate,
-    purchaseRate: purchase.rate,
-    purchasedQuantity: purchase.receivedQuantity || purchase.quantity,
-    remainingQuantity: purchase.receivedQuantity || purchase.quantity,
+    purchaseRate: incomingRate,
+    purchasedQuantity: incomingQty,
+    remainingQuantity: incomingQty,
     location: "Shop",
+    costingUnit: purchase.costingUnit || 'kg',
     status: "Available",
     createdBy: purchase.createdBy
   });
 
   await newStock.save();
+  return newStock;
 };
 
 // Get all purchases
@@ -120,6 +143,8 @@ exports.addPurchase = async (req, res) => {
 
     // Money paid to the supplier now (only when the purchase is added as Completed)
     const { payment, ...body } = req.body;
+    if (body.billNumber !== undefined) body.billNumber = String(body.billNumber).trim();
+    if (body.partyMobileNumber !== undefined) body.partyMobileNumber = String(body.partyMobileNumber).trim();
     // Created by = the logged-in panel (store name); super admin keeps the name the form sends
     if (req.user && req.user.role !== 'super_admin') body.createdBy = req.user.name;
     if (!body.createdBy) body.createdBy = req.user?.name || 'Admin';
@@ -134,6 +159,19 @@ exports.addPurchase = async (req, res) => {
       const checked = splitFromBody(req.body, Number(body.quantity) || 0, Number(body.receivedQuantity));
       if (checked.error) return res.status(400).json({ message: checked.error });
       split = checked.split;
+    }
+
+    // Driver freight calculation (strictly per KG in Rupees or Paise)
+    const wt = body.receivedQuantity != null ? Number(body.receivedQuantity) : Number(body.quantity) || 0;
+    const dRate = Number(body.driverRatePerKg) || 0;
+    const dUnit = body.driverRateUnit === 'paise' ? 'paise' : 'rupee';
+    if (dRate > 0) {
+      body.driverFreightTotal = dUnit === 'paise'
+        ? Math.round((wt * dRate / 100) * 100) / 100
+        : Math.round((wt * dRate) * 100) / 100;
+      if (!body.transportCost || Number(body.transportCost) === 0) {
+        body.transportCost = dUnit === 'paise' ? (dRate / 100) : dRate;
+      }
     }
 
     const newPurchase = new Purchase({
@@ -171,12 +209,13 @@ exports.deletePurchase = async (req, res) => {
     if (!deletedPurchase) {
       return res.status(404).json({ message: 'Purchase not found' });
     }
-    // Delete the associated stock batch if it exists
-    await Stock.deleteMany({ purchaseId: id });
+
+    // Delete the corresponding stock batch created specifically for this purchase
+    await Stock.findOneAndDelete({ purchaseId: deletedPurchase._id });
     await removeLoss(id);
     await Expense.deleteMany({ purchase: id });
 
-    res.status(200).json({ message: 'Purchase and associated stock deleted successfully' });
+    res.status(200).json({ message: 'Purchase and associated stock batch removed successfully' });
   } catch (error) {
     res.status(500).json({ message: 'Error deleting purchase', error: error.message });
   }
@@ -186,10 +225,11 @@ exports.deletePurchase = async (req, res) => {
 exports.updatePurchaseStatus = async (req, res) => {
   try {
     const { id } = req.params;
-    const { status, receivedQty, wasteReason, payment, paidBy } = req.body;
+    const { status, receivedQty, wasteReason, payment, paidBy, billNumber, partyMobileNumber } = req.body;
 
     let updateFields = { status };
-    let oldReceivedQty = null;
+    if (billNumber !== undefined) updateFields.billNumber = String(billNumber).trim();
+    if (partyMobileNumber !== undefined) updateFields.partyMobileNumber = String(partyMobileNumber).trim();
     let purchase = null;
     let split = null;
 
@@ -212,11 +252,17 @@ exports.updatePurchaseStatus = async (req, res) => {
           if (checked.error) return res.status(400).json({ message: checked.error });
           split = checked.split;
         }
-        oldReceivedQty = purchase.receivedQuantity != null ? purchase.receivedQuantity : purchase.quantity;
         updateFields.receivedQuantity = Number(receivedQty);
         updateFields.totalPrice = Number(receivedQty) * purchase.rate;
         if (wasteReason !== undefined) {
           updateFields.wasteReason = wasteReason;
+        }
+        if (purchase.driverRatePerKg && purchase.driverRatePerKg > 0) {
+          const dRate = purchase.driverRatePerKg;
+          const dUnit = purchase.driverRateUnit || 'rupee';
+          updateFields.driverFreightTotal = dUnit === 'paise'
+            ? Math.round((Number(receivedQty) * dRate / 100) * 100) / 100
+            : Math.round((Number(receivedQty) * dRate) * 100) / 100;
         }
       }
     }
@@ -230,19 +276,11 @@ exports.updatePurchaseStatus = async (req, res) => {
       return res.status(404).json({ message: 'Purchase not found' });
     }
     
-    // Create or update stock batch
+    // Create or update stock for this specific purchase batch
     if (updatedPurchase.status === 'Completed') {
-      if (purchase && purchase.status === 'Completed' && oldReceivedQty !== null && Number(receivedQty) !== oldReceivedQty) {
-        const diff = Number(receivedQty) - oldReceivedQty;
-        const stockBatch = await Stock.findOne({ purchaseId: updatedPurchase._id });
-        if (stockBatch) {
-          stockBatch.purchasedQuantity = Number(stockBatch.purchasedQuantity) + diff;
-          stockBatch.remainingQuantity = Number(stockBatch.remainingQuantity) + diff;
-          await stockBatch.save();
-        }
-      } else {
-        await createStockBatch(updatedPurchase);
-      }
+      await createStockBatch(updatedPurchase);
+    } else {
+      await Stock.findOneAndDelete({ purchaseId: updatedPurchase._id });
     }
     await syncPurchaseLoss(updatedPurchase, split);
     if (payNow) await payPurchase(updatedPurchase, { ...payNow, createdBy: paidBy || updatedPurchase.createdBy });
@@ -258,6 +296,8 @@ exports.updatePurchase = async (req, res) => {
   try {
     const { id } = req.params;
     const updates = req.body;
+    if (updates.billNumber !== undefined) updates.billNumber = String(updates.billNumber).trim();
+    if (updates.partyMobileNumber !== undefined) updates.partyMobileNumber = String(updates.partyMobileNumber).trim();
     
     const purchase = await Purchase.findById(id);
     if (!purchase) {
@@ -278,22 +318,6 @@ exports.updatePurchase = async (req, res) => {
     delete updates.receiveLoss;
     delete updates.amountPaid; // only changed through finance payments
 
-    // Check if receivedQuantity is updated and status is Completed
-    if (updates.receivedQuantity !== undefined && purchase.status === 'Completed') {
-      const currentReceivedQty = purchase.receivedQuantity != null ? purchase.receivedQuantity : purchase.quantity;
-      const diff = Number(updates.receivedQuantity) - currentReceivedQty;
-      if (diff !== 0) {
-        // Need to update the stock batch
-        const Stock = require('../models/Stock');
-        const stockBatch = await Stock.findOne({ purchaseId: purchase._id });
-        if (stockBatch) {
-          stockBatch.purchasedQuantity = Number(stockBatch.purchasedQuantity) + diff;
-          stockBatch.remainingQuantity = Number(stockBatch.remainingQuantity) + diff;
-          await stockBatch.save();
-        }
-      }
-    }
-
     // Recalculate total price if rate or receivedQty changes
     if (updates.receivedQuantity !== undefined && updates.rate !== undefined) {
        updates.totalPrice = Number(updates.receivedQuantity) * Number(updates.rate);
@@ -301,6 +325,21 @@ exports.updatePurchase = async (req, res) => {
        updates.totalPrice = Number(updates.receivedQuantity) * purchase.rate;
     } else if (updates.rate !== undefined) {
        updates.totalPrice = (purchase.receivedQuantity || purchase.quantity) * Number(updates.rate);
+    }
+
+    // Recalculate driver freight total
+    const effectiveQty = updates.receivedQuantity !== undefined
+      ? Number(updates.receivedQuantity)
+      : (updates.quantity !== undefined ? Number(updates.quantity) : (purchase.receivedQuantity != null ? purchase.receivedQuantity : purchase.quantity));
+    const effectiveRate = updates.driverRatePerKg !== undefined ? Number(updates.driverRatePerKg) : (purchase.driverRatePerKg || 0);
+    const effectiveUnit = updates.driverRateUnit !== undefined ? updates.driverRateUnit : (purchase.driverRateUnit || 'rupee');
+    if (effectiveRate > 0) {
+      updates.driverFreightTotal = effectiveUnit === 'paise'
+        ? Math.round((effectiveQty * effectiveRate / 100) * 100) / 100
+        : Math.round((effectiveQty * effectiveRate) * 100) / 100;
+      if (updates.transportCost === undefined && (!purchase.transportCost || purchase.transportCost === 0)) {
+        updates.transportCost = effectiveUnit === 'paise' ? (effectiveRate / 100) : effectiveRate;
+      }
     }
 
     const updatedPurchase = await Purchase.findByIdAndUpdate(
@@ -311,21 +350,32 @@ exports.updatePurchase = async (req, res) => {
     
     if (updatedPurchase.status === 'Completed') {
       await createStockBatch(updatedPurchase);
+    } else {
+      await Stock.findOneAndDelete({ purchaseId: updatedPurchase._id });
     }
     await syncPurchaseLoss(updatedPurchase, split);
 
-    // Rate or per-theli costs changed: re-cost the theli already packed from this batch
+    // Rate, per-theli costs, or costing unit changed: re-cost the theli already packed from this batch
     const costChanged = ['rate', 'packagingCost', 'transportCost', 'otherCost']
-      .some(k => updates[k] !== undefined && Number(updates[k]) !== (Number(purchase[k]) || 0));
+      .some(k => updates[k] !== undefined && Number(updates[k]) !== (Number(purchase[k]) || 0))
+      || (updates.costingUnit !== undefined && updates.costingUnit !== purchase.costingUnit);
     if (costChanged) {
-      const stockBatch = await Stock.findOne({ purchaseId: purchase._id });
+      const stockBatch = await Stock.findOne({ purchaseId: updatedPurchase._id });
       if (stockBatch) {
         if (updates.rate !== undefined) {
           stockBatch.purchaseRate = Number(updates.rate);
-          await stockBatch.save();
         }
+        if (updates.costingUnit !== undefined) {
+          stockBatch.costingUnit = updates.costingUnit;
+        }
+        await stockBatch.save();
         const packed = await ReadyStock.find({ stockBatchId: stockBatch.batchId });
-        for (const rs of packed) await recalcReadyStock(rs);
+        for (const rs of packed) {
+          if (updates.costingUnit !== undefined) {
+            rs.costingUnit = updates.costingUnit;
+          }
+          await recalcReadyStock(rs);
+        }
       }
     }
     

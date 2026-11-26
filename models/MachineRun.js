@@ -33,7 +33,14 @@ const machineRunSchema = new mongoose.Schema({
     reason: { type: String, default: '' }
   }],
   operatorName: { type: String, required: true },
+  costingUnit: { type: String, enum: ['theli', 'kg', 'gram'], default: 'theli' },
   notes: { type: String },
+  batchAllocations: [{
+    stockId: { type: mongoose.Schema.Types.ObjectId, ref: 'Stock' },
+    batchId: { type: String },
+    quantity: { type: Number },
+    purchaseRate: { type: Number }
+  }],
   startTime: { type: Date, default: Date.now },
   endTime: { type: Date }
 }, { timestamps: true });

@@ -54,6 +54,8 @@ app.use('/api/sales', require('./routes/saleRoutes'));
 app.use('/api/dashboard', require('./routes/dashboardRoutes'));
 app.use('/api/loss', require('./routes/lossRoutes'));
 app.use('/api/finance', require('./routes/financeRoutes'));
+app.use('/api/team', require('./routes/teamRoutes'));
+app.use('/api/drivers', require('./routes/driverRoutes'));
 app.use('/api/audit', require('./routes/auditRoutes'));
 
 // Database connection and Super Admin Seeding
@@ -88,7 +90,12 @@ mongoose.connect(process.env.MONGO_URI).then(async () => {
     console.error('MongoDB connection error:', error);
 });
 
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-    console.log(`Server is running on port ${PORT}`);
-});
+// Local: start the server. On Vercel the exported app is used instead.
+if (require.main === module) {
+    const PORT = process.env.PORT || 5000;
+    app.listen(PORT, () => {
+        console.log(`Server is running on port ${PORT}`);
+    });
+}
+
+module.exports = app;

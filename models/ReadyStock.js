@@ -8,7 +8,10 @@ const readyStockSchema = new mongoose.Schema({
   productionBatchId: { type: String, required: true, unique: true },
   machineRunId: { type: mongoose.Schema.Types.ObjectId, ref: 'MachineRun', required: true },
   stockBatchId: { type: String },
+  costingUnit: { type: String, enum: ['theli', 'kg', 'gram'], default: 'theli' },
   costPerPacket: { type: Number, default: 0 },
+  costPerKg: { type: Number, default: 0 },
+  costPerGram: { type: Number, default: 0 },
   // How costPerPacket was built up (all values per theli)
   costing: {
     purchaseRate: { type: Number, default: 0 },
@@ -18,7 +21,11 @@ const readyStockSchema = new mongoose.Schema({
     transportCost: { type: Number, default: 0 },
     otherCost: { type: Number, default: 0 },
     wastageCost: { type: Number, default: 0 },
-    spreadWastage: { type: Boolean, default: false }
+    spreadWastage: { type: Boolean, default: false },
+    costingUnit: { type: String, default: 'theli' },
+    unitPackagingCost: { type: Number, default: 0 },
+    unitTransportCost: { type: Number, default: 0 },
+    unitOtherCost: { type: Number, default: 0 }
   },
   availablePackets: { type: Number, default: 0 },
   availableWeightKg: { type: Number, default: 0 },

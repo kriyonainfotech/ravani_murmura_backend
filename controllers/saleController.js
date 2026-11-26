@@ -91,23 +91,38 @@ exports.createSale = async (req, res) => {
         productName,
         packetSizeGrams,
         quantityTheli,
-        rateType = 'theli', // 'theli' or 'kg'
+        weightKg,
+        quantityGram,
+        soldQuantity,
+        soldUnit,
+        rateType = 'theli', // 'theli' | 'kg' | 'gram'
         sellingRate,
         batchSelection = 'AUTO_FIFO', // 'AUTO_FIFO' or specific source ID
         inventorySourceId
       } = item;
 
-      const numTheli = Number(quantityTheli);
-      const pktGrams = Number(packetSizeGrams);
-      const calculatedWeightKg = (numTheli * pktGrams) / 1000;
-      const rate = Number(sellingRate);
+      const unit = soldUnit || rateType || 'theli';
+      const pktGrams = Number(packetSizeGrams) || 0;
+      const rate = Number(sellingRate) || 0;
 
-      // Calculate item amount
+      let numTheli = 0;
+      let calculatedWeightKg = 0;
       let itemAmount = 0;
-      if (rateType === 'theli') {
-        itemAmount = numTheli * rate;
+
+      if (unit === 'kg') {
+        const enteredKg = soldQuantity != null ? Number(soldQuantity) : (weightKg != null && weightKg !== '' ? Number(weightKg) : (Number(quantityTheli) * pktGrams) / 1000);
+        calculatedWeightKg = Number(enteredKg.toFixed(3));
+        numTheli = pktGrams > 0 ? Number(((calculatedWeightKg * 1000) / pktGrams).toFixed(2)) : (Number(quantityTheli) || 0);
+        itemAmount = Number((calculatedWeightKg * rate).toFixed(2));
+      } else if (unit === 'gram') {
+        const enteredGrams = soldQuantity != null ? Number(soldQuantity) : (quantityGram != null && quantityGram !== '' ? Number(quantityGram) : (weightKg != null && weightKg !== '' ? Number(weightKg) * 1000 : Number(quantityTheli) * pktGrams));
+        calculatedWeightKg = Number((enteredGrams / 1000).toFixed(3));
+        numTheli = pktGrams > 0 ? Number((enteredGrams / pktGrams).toFixed(2)) : (Number(quantityTheli) || 0);
+        itemAmount = Number((enteredGrams * rate).toFixed(2));
       } else {
-        itemAmount = calculatedWeightKg * rate;
+        numTheli = soldQuantity != null ? Number(soldQuantity) : (Number(quantityTheli) || 0);
+        calculatedWeightKg = pktGrams > 0 ? Number(((numTheli * pktGrams) / 1000).toFixed(3)) : (Number(weightKg) || 0);
+        itemAmount = Number((numTheli * rate).toFixed(2));
       }
 
       // Handle Stock Deduction & FIFO / Manual batch
@@ -123,22 +138,42 @@ exports.createSale = async (req, res) => {
         if (!stockRecord) {
           return res.status(404).json({ message: `Stock batch not found for ${productName}` });
         }
-        if (stockRecord.availablePackets < numTheli) {
-          return res.status(400).json({
-            message: `Insufficient stock in batch ${stockRecord.productionBatchId}. Available: ${stockRecord.availablePackets}, Requested: ${numTheli}`
-          });
+
+        if (unit === 'theli') {
+          if (stockRecord.availablePackets < numTheli && stockRecord.availableWeightKg < calculatedWeightKg - 0.0001) {
+            return res.status(400).json({
+              message: `Insufficient stock in batch ${stockRecord.productionBatchId}. Available: ${stockRecord.availablePackets} packets, Requested: ${numTheli}`
+            });
+          }
+        } else {
+          if (stockRecord.availableWeightKg < calculatedWeightKg - 0.0001) {
+            return res.status(400).json({
+              message: `Insufficient stock in batch ${stockRecord.productionBatchId}. Available: ${stockRecord.availableWeightKg} KG, Requested: ${calculatedWeightKg} KG`
+            });
+          }
         }
 
-        const costPerPkt = stockRecord.costPerPacket || 0;
-        const itemCost = numTheli * costPerPkt;
-        const itemProfit = itemAmount - itemCost;
+        const costPerPkt = Number(stockRecord.costPerPacket) || 0;
+        const costKg = Number(stockRecord.costPerKg) || (pktGrams > 0 ? costPerPkt * (1000 / pktGrams) : costPerPkt);
+        const costGram = Number(stockRecord.costPerGram) || (costKg / 1000);
+
+        let itemCost = 0;
+        if (unit === 'kg') {
+          itemCost = Number((calculatedWeightKg * costKg).toFixed(2));
+        } else if (unit === 'gram') {
+          itemCost = Number(((calculatedWeightKg * 1000) * costGram).toFixed(2));
+        } else {
+          itemCost = Number((numTheli * costPerPkt).toFixed(2));
+        }
+        const itemProfit = Number((itemAmount - itemCost).toFixed(2));
 
         // Deduct
-        stockRecord.availablePackets -= numTheli;
-        stockRecord.availableWeightKg = Math.max(0, stockRecord.availableWeightKg - calculatedWeightKg);
+        stockRecord.availablePackets = Math.max(0, Math.round(stockRecord.availablePackets - numTheli));
+        stockRecord.availableWeightKg = Math.max(0, Number((stockRecord.availableWeightKg - calculatedWeightKg).toFixed(3)));
+        if (stockRecord.availableWeightKg === 0) stockRecord.availablePackets = 0;
         if (sellFrom === 'Packaging Godown') {
           stockRecord.dispatchedPackets = (stockRecord.dispatchedPackets || 0) + numTheli;
-          stockRecord.dispatchedWeightKg = (stockRecord.dispatchedWeightKg || 0) + calculatedWeightKg;
+          stockRecord.dispatchedWeightKg = Number(((stockRecord.dispatchedWeightKg || 0) + calculatedWeightKg).toFixed(3));
         }
         await stockRecord.save();
 
@@ -157,9 +192,13 @@ exports.createSale = async (req, res) => {
           packetSizeGrams: pktGrams,
           quantityTheli: numTheli,
           weightKg: calculatedWeightKg,
-          rateType,
+          rateType: unit,
+          soldUnit: unit,
+          soldQuantity: unit === 'kg' ? calculatedWeightKg : (unit === 'gram' ? calculatedWeightKg * 1000 : numTheli),
           sellingRate: rate,
           costPerPacket: costPerPkt,
+          costPerKg: costKg,
+          costPerGram: costGram,
           itemAmount,
           itemCost,
           itemProfit,
@@ -174,85 +213,167 @@ exports.createSale = async (req, res) => {
 
       } else {
         // AUTO_FIFO: Allocate across oldest available batches
-        let remainingNeeded = numTheli;
         let candidateBatches = [];
 
         if (sellFrom === 'Packaging Godown') {
           candidateBatches = await ReadyStock.find({
             productType: productName,
             packetSizeGrams: pktGrams,
-            availablePackets: { $gt: 0 }
+            availableWeightKg: { $gt: 0 }
           }).sort({ productionDate: 1 });
         } else {
           candidateBatches = await ShopStock.find({
             productType: productName,
             packetSizeGrams: pktGrams,
-            availablePackets: { $gt: 0 }
+            availableWeightKg: { $gt: 0 }
           }).sort({ receivedDate: 1 });
         }
 
-        const totalAvailable = candidateBatches.reduce((acc, b) => acc + b.availablePackets, 0);
-        if (totalAvailable < numTheli) {
-          return res.status(400).json({
-            message: `Insufficient stock for ${productName} (${pktGrams}g). Total Available: ${totalAvailable}, Requested: ${numTheli}`
-          });
-        }
-
-        for (const batch of candidateBatches) {
-          if (remainingNeeded <= 0) break;
-
-          const takeFromThis = Math.min(batch.availablePackets, remainingNeeded);
-          const weightFromThis = (takeFromThis * pktGrams) / 1000;
-          
-          let subItemAmount = 0;
-          if (rateType === 'theli') {
-            subItemAmount = takeFromThis * rate;
-          } else {
-            subItemAmount = weightFromThis * rate;
+        if (unit === 'theli') {
+          const totalAvailable = candidateBatches.reduce((acc, b) => acc + (b.availablePackets || 0), 0);
+          if (totalAvailable < numTheli) {
+            return res.status(400).json({
+              message: `Insufficient stock for ${productName} (${pktGrams}g). Total Available: ${totalAvailable}, Requested: ${numTheli}`
+            });
           }
 
-          const costPerPkt = batch.costPerPacket || 0;
-          const subItemCost = takeFromThis * costPerPkt;
-          const subItemProfit = subItemAmount - subItemCost;
+          let remainingNeeded = numTheli;
+          for (const batch of candidateBatches) {
+            if (remainingNeeded <= 0) break;
 
-          batch.availablePackets -= takeFromThis;
-          batch.availableWeightKg = Math.max(0, batch.availableWeightKg - weightFromThis);
-          if (sellFrom === 'Packaging Godown') {
-            batch.dispatchedPackets = (batch.dispatchedPackets || 0) + takeFromThis;
-            batch.dispatchedWeightKg = (batch.dispatchedWeightKg || 0) + weightFromThis;
+            const takeFromThis = Math.min(batch.availablePackets, remainingNeeded);
+            const weightFromThis = Number(((takeFromThis * pktGrams) / 1000).toFixed(3));
+            const subItemAmount = Number((takeFromThis * rate).toFixed(2));
+
+            const costPerPkt = Number(batch.costPerPacket) || 0;
+            const costKg = Number(batch.costPerKg) || (pktGrams > 0 ? costPerPkt * (1000 / pktGrams) : costPerPkt);
+            const costGram = Number(batch.costPerGram) || (costKg / 1000);
+            const subItemCost = Number((takeFromThis * costPerPkt).toFixed(2));
+            const subItemProfit = Number((subItemAmount - subItemCost).toFixed(2));
+
+            batch.availablePackets -= takeFromThis;
+            batch.availableWeightKg = Math.max(0, Number((batch.availableWeightKg - weightFromThis).toFixed(3)));
+            if (batch.availableWeightKg === 0) batch.availablePackets = 0;
+            if (sellFrom === 'Packaging Godown') {
+              batch.dispatchedPackets = (batch.dispatchedPackets || 0) + takeFromThis;
+              batch.dispatchedWeightKg = Number(((batch.dispatchedWeightKg || 0) + weightFromThis).toFixed(3));
+            }
+            await batch.save();
+
+            let challanId = '';
+            if (batch.dispatchId) {
+              const dispatchDoc = await PackagingDispatch.findById(batch.dispatchId);
+              if (dispatchDoc) challanId = dispatchDoc.dispatchId;
+            }
+
+            processedItems.push({
+              productName,
+              productionBatchId: batch.productionBatchId,
+              stockBatchId: batch.stockBatchId || '',
+              challanId,
+              storeName: batch.storeName || '',
+              packetSizeGrams: pktGrams,
+              quantityTheli: takeFromThis,
+              weightKg: weightFromThis,
+              rateType: 'theli',
+              soldUnit: 'theli',
+              soldQuantity: takeFromThis,
+              sellingRate: rate,
+              costPerPacket,
+              costPerKg,
+              costPerGram,
+              itemAmount: subItemAmount,
+              itemCost: subItemCost,
+              itemProfit: subItemProfit,
+              inventorySourceId: batch._id,
+              inventoryType: sellFrom === 'Packaging Godown' ? 'ReadyStock' : 'ShopStock'
+            });
+
+            totalTheli += takeFromThis;
+            totalWeightKg += weightFromThis;
+            subTotal += subItemAmount;
+            totalCost += subItemCost;
+            remainingNeeded -= takeFromThis;
           }
-          await batch.save();
-
-          let challanId = '';
-          if (batch.dispatchId) {
-            const dispatchDoc = await PackagingDispatch.findById(batch.dispatchId);
-            if (dispatchDoc) challanId = dispatchDoc.dispatchId;
+        } else {
+          // Weight-based FIFO (KG or Gram)
+          const totalAvailKg = candidateBatches.reduce((acc, b) => acc + (b.availableWeightKg || 0), 0);
+          if (totalAvailKg < calculatedWeightKg - 0.0001) {
+            return res.status(400).json({
+              message: `Insufficient stock for ${productName}. Total Available: ${totalAvailKg.toFixed(2)} KG, Requested: ${calculatedWeightKg} KG`
+            });
           }
 
-          processedItems.push({
-            productName,
-            productionBatchId: batch.productionBatchId,
-            stockBatchId: batch.stockBatchId || '',
-            challanId,
-            storeName: batch.storeName || '',
-            packetSizeGrams: pktGrams,
-            quantityTheli: takeFromThis,
-            weightKg: weightFromThis,
-            rateType,
-            sellingRate: rate,
-            costPerPacket: costPerPkt,
-            itemAmount: subItemAmount,
-            itemCost: subItemCost,
-            itemProfit: subItemProfit,
-            inventorySourceId: batch._id,
-            inventoryType: sellFrom === 'Packaging Godown' ? 'ReadyStock' : 'ShopStock'
-          });
+          let remainingWeight = calculatedWeightKg;
+          for (const batch of candidateBatches) {
+            if (remainingWeight <= 0.0001) break;
 
-          totalTheli += takeFromThis;
-          totalWeightKg += weightFromThis;
-          subTotal += subItemAmount;
-          totalCost += subItemCost;
-          remainingNeeded -= takeFromThis;
+            const weightFromThis = Math.min(batch.availableWeightKg, remainingWeight);
+            const theliFromThis = pktGrams > 0 ? Number(((weightFromThis * 1000) / pktGrams).toFixed(2)) : 0;
+            
+            let subItemAmount = 0;
+            if (unit === 'kg') {
+              subItemAmount = Number((weightFromThis * rate).toFixed(2));
+            } else {
+              subItemAmount = Number(((weightFromThis * 1000) * rate).toFixed(2));
+            }
+
+            const costPerPkt = Number(batch.costPerPacket) || 0;
+            const costKg = Number(batch.costPerKg) || (pktGrams > 0 ? costPerPkt * (1000 / pktGrams) : costPerPkt);
+            const costGram = Number(batch.costPerGram) || (costKg / 1000);
+
+            let subItemCost = 0;
+            if (unit === 'kg') {
+              subItemCost = Number((weightFromThis * costKg).toFixed(2));
+            } else {
+              subItemCost = Number(((weightFromThis * 1000) * costGram).toFixed(2));
+            }
+            const subItemProfit = Number((subItemAmount - subItemCost).toFixed(2));
+
+            batch.availableWeightKg = Math.max(0, Number((batch.availableWeightKg - weightFromThis).toFixed(3)));
+            batch.availablePackets = Math.max(0, Math.round(batch.availablePackets - theliFromThis));
+            if (batch.availableWeightKg === 0) batch.availablePackets = 0;
+            if (sellFrom === 'Packaging Godown') {
+              batch.dispatchedPackets = (batch.dispatchedPackets || 0) + theliFromThis;
+              batch.dispatchedWeightKg = Number(((batch.dispatchedWeightKg || 0) + weightFromThis).toFixed(3));
+            }
+            await batch.save();
+
+            let challanId = '';
+            if (batch.dispatchId) {
+              const dispatchDoc = await PackagingDispatch.findById(batch.dispatchId);
+              if (dispatchDoc) challanId = dispatchDoc.dispatchId;
+            }
+
+            processedItems.push({
+              productName,
+              productionBatchId: batch.productionBatchId,
+              stockBatchId: batch.stockBatchId || '',
+              challanId,
+              storeName: batch.storeName || '',
+              packetSizeGrams: pktGrams,
+              quantityTheli: theliFromThis,
+              weightKg: weightFromThis,
+              rateType: unit,
+              soldUnit: unit,
+              soldQuantity: unit === 'kg' ? weightFromThis : weightFromThis * 1000,
+              sellingRate: rate,
+              costPerPacket,
+              costPerKg,
+              costPerGram,
+              itemAmount: subItemAmount,
+              itemCost: subItemCost,
+              itemProfit: subItemProfit,
+              inventorySourceId: batch._id,
+              inventoryType: sellFrom === 'Packaging Godown' ? 'ReadyStock' : 'ShopStock'
+            });
+
+            totalTheli += theliFromThis;
+            totalWeightKg += weightFromThis;
+            subTotal += subItemAmount;
+            totalCost += subItemCost;
+            remainingWeight -= weightFromThis;
+          }
         }
       }
     }

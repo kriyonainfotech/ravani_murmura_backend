@@ -70,6 +70,11 @@ const stockSchema = new mongoose.Schema({
     enum: ["Shop", "In Transit", "Packaging Godown", "In Machine", "Ready", "Returned"],
     default: "Shop"
   },
+  costingUnit: {
+    type: String,
+    enum: ['theli', 'kg', 'gram'],
+    default: 'theli'
+  },
   status: {
     type: String,
     default: "Available"

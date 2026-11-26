@@ -58,6 +58,19 @@ const shopStockSchema = new mongoose.Schema({
     type: Number,
     default: 0
   },
+  costPerKg: {
+    type: Number,
+    default: 0
+  },
+  costPerGram: {
+    type: Number,
+    default: 0
+  },
+  costingUnit: {
+    type: String,
+    enum: ['theli', 'kg', 'gram'],
+    default: 'theli'
+  },
   receivedDate: {
     type: Date,
     default: Date.now

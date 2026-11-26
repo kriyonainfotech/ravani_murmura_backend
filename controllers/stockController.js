@@ -77,6 +77,8 @@ exports.getCostingReport = async (req, res) => {
       const saved = rs.costing && rs.costing.packetsPerKg > 0;
       const costing = saved ? rs.costing.toObject() : live.costing;
       const costPerPacket = saved ? rs.costPerPacket : live.costPerPacket;
+      const costPerKg = rs.costPerKg || live.costPerKg || (costing.costPerKg) || (rs.packetSizeGrams > 0 ? costPerPacket * (1000 / rs.packetSizeGrams) : 0);
+      const costPerGram = rs.costPerGram || live.costPerGram || (costing.costPerGram) || (costPerKg / 1000);
       const sellingRate = live.setting ? Number(live.setting.defaultSellingRate) || 0 : 0;
       rows.push({
         _id: rs._id,
@@ -92,6 +94,8 @@ exports.getCostingReport = async (req, res) => {
         availablePackets: rs.availablePackets,
         costing,
         costPerPacket,
+        costPerKg,
+        costPerGram,
         sellingRate,
         profitPerPacket: sellingRate - costPerPacket
       });

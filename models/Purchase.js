@@ -7,13 +7,20 @@ const purchaseSchema = new mongoose.Schema({
     required: true,
     unique: true
   },
+  billNumber: {
+    type: String,
+    default: '',
+    trim: true
+  },
   supplier: {
     type: String,
-    required: true
+    required: true,
+    trim: true
   },
   partyMobileNumber: {
     type: String,
-    default: ''
+    default: '',
+    trim: true
   },
   purchaseDate: {
     type: Date,
@@ -35,7 +42,12 @@ const purchaseSchema = new mongoose.Schema({
     type: Number,
     required: true
   },
-  // Costs added to each theli packed from this batch (₹ per theli)
+  // Costs added to each theli packed from this batch (₹ per theli, per KG, or per gram)
+  costingUnit: {
+    type: String,
+    enum: ['theli', 'kg', 'gram'],
+    default: 'theli'
+  },
   packagingCost: {
     type: Number,
     default: 0
@@ -48,6 +60,11 @@ const purchaseSchema = new mongoose.Schema({
     type: Number,
     default: 0
   },
+  driverId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Driver',
+    default: null
+  },
   driverName: {
     type: String,
     default: ''
@@ -59,6 +76,23 @@ const purchaseSchema = new mongoose.Schema({
   tempoNumber: {
     type: String,
     default: ''
+  },
+  driverRatePerKg: {
+    type: Number,
+    default: 0
+  },
+  driverRateUnit: {
+    type: String,
+    enum: ['rupee', 'paise'],
+    default: 'rupee'
+  },
+  driverFreightTotal: {
+    type: Number,
+    default: 0
+  },
+  driverAdvance: {
+    type: Number,
+    default: 0
   },
   fromAddress: {
     type: String,

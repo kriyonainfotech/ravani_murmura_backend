@@ -22,9 +22,14 @@ exports.createDispatch = async (req, res) => {
       stockId,
       sentQuantity,
       packagingRollQuantity,
+      driverId,
       driverName,
       driverMobileNumber,
       tempoNumberPlate,
+      driverRatePerKg,
+      driverRateUnit,
+      driverFreightTotal,
+      driverAdvance,
       targetPanelId,
       fromAddress,
       toAddress,
@@ -47,9 +52,14 @@ exports.createDispatch = async (req, res) => {
       productName: stock.productName,
       sentQuantity,
       packagingRollQuantity,
-      driverName,
-      driverMobileNumber,
-      tempoNumberPlate,
+      driverId: driverId || null,
+      driverName: driverName || '',
+      driverMobileNumber: driverMobileNumber || '',
+      tempoNumberPlate: tempoNumberPlate || '',
+      driverRatePerKg: Number(driverRatePerKg) || 0,
+      driverRateUnit: driverRateUnit === 'paise' ? 'paise' : 'rupee',
+      driverFreightTotal: Number(driverFreightTotal) || 0,
+      driverAdvance: Number(driverAdvance) || 0,
       targetPanelId,
       fromAddress,
       toAddress,
@@ -62,6 +72,8 @@ exports.createDispatch = async (req, res) => {
     stock.remainingQuantity -= sentQuantity;
     stock.inTransitQuantity += sentQuantity;
     await stock.save();
+
+    await newRequest.populate('targetPanelId', 'name email location phone');
 
     res.status(201).json(newRequest);
   } catch (error) {

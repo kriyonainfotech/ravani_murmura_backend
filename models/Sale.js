@@ -7,9 +7,13 @@ const saleItemSchema = new mongoose.Schema({
   packetSizeGrams: { type: Number, required: true },
   quantityTheli: { type: Number, required: true },
   weightKg: { type: Number, required: true },
-  rateType: { type: String, enum: ['theli', 'kg'], default: 'theli' },
-  sellingRate: { type: Number, required: true }, // Rate per theli or per kg depending on rateType
+  rateType: { type: String, enum: ['theli', 'kg', 'gram'], default: 'theli' },
+  soldUnit: { type: String, enum: ['theli', 'kg', 'gram'], default: 'theli' },
+  soldQuantity: { type: Number },
+  sellingRate: { type: Number, required: true }, // Rate per theli, per kg, or per gram depending on rateType
   costPerPacket: { type: Number, default: 0 },
+  costPerKg: { type: Number, default: 0 },
+  costPerGram: { type: Number, default: 0 },
   itemAmount: { type: Number, required: true },
   itemCost: { type: Number, default: 0 },
   itemProfit: { type: Number, default: 0 },
