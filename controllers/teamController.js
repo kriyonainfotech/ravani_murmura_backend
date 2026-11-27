@@ -668,18 +668,45 @@ exports.getMemberAdvanceBalances = async (req, res) => {
 // 4. SALARY & PAYROLL
 // ==========================================
 
+const emptyPayrollAttendance = { presentDays: 0, halfDays: 0, absentDays: 0, paidLeaveDays: 0, overtimeHours: 0 };
+
+const getPayrollAttendance = async (month) => {
+  const attendanceRecords = await Attendance.find({ dateStr: { $regex: `^${month}` } }).lean();
+  const attMap = {};
+  attendanceRecords.forEach(r => {
+    const id = r.member.toString();
+    if (!attMap[id]) {
+      attMap[id] = { ...emptyPayrollAttendance };
+    }
+    if (r.status === 'Present') attMap[id].presentDays += 1;
+    else if (r.status === 'Half Day') { attMap[id].halfDays += 1; attMap[id].presentDays += 0.5; }
+    else if (r.status === 'Absent') attMap[id].absentDays += 1;
+    else if (r.status === 'Paid Leave') { attMap[id].paidLeaveDays += 1; attMap[id].presentDays += 1.0; }
+
+    attMap[id].overtimeHours += (r.overtimeHours || 0);
+  });
+  return attMap;
+};
+
 // Get payroll for a specific month (month: 'YYYY-MM')
 exports.getPayroll = async (req, res) => {
   try {
     const { month } = req.query;
-    if (!month) {
+    if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(month)) {
       return res.status(400).json({ success: false, message: 'month parameter is required (YYYY-MM)' });
     }
 
-    const payrolls = await Payroll.find({ month })
-      .populate('member', 'name employeeId role phone salaryType baseSalary department')
-      .sort({ createdAt: 1 })
-      .lean();
+    const [records, attendance] = await Promise.all([
+      Payroll.find({ month })
+        .populate('member', 'name employeeId role phone salaryType baseSalary department')
+        .sort({ createdAt: 1 })
+        .lean(),
+      getPayrollAttendance(month)
+    ]);
+    const payrolls = records.map((payroll) => ({
+      ...payroll,
+      ...(attendance[payroll.member?._id?.toString()] || emptyPayrollAttendance)
+    }));
 
     // Summary calculations
     const summary = {
@@ -745,21 +772,7 @@ exports.calculateMonthlyPayroll = async (req, res) => {
     const monthLabel = formatMonthLabel(month);
     const members = await TeamMember.find({ status: 'Active' }).sort({ name: 1 });
 
-    // Fetch month's attendance for all members
-    const attendanceRecords = await Attendance.find({ dateStr: { $regex: `^${month}` } }).lean();
-    const attMap = {};
-    attendanceRecords.forEach(r => {
-      const id = r.member.toString();
-      if (!attMap[id]) {
-        attMap[id] = { presentDays: 0, halfDays: 0, absentDays: 0, paidLeaveDays: 0, overtimeHours: 0 };
-      }
-      if (r.status === 'Present') attMap[id].presentDays += 1;
-      else if (r.status === 'Half Day') { attMap[id].halfDays += 1; attMap[id].presentDays += 0.5; }
-      else if (r.status === 'Absent') attMap[id].absentDays += 1;
-      else if (r.status === 'Paid Leave') { attMap[id].paidLeaveDays += 1; attMap[id].presentDays += 1.0; }
-
-      attMap[id].overtimeHours += (r.overtimeHours || 0);
-    });
+    const attMap = await getPayrollAttendance(month);
 
     const existingPayrolls = await Payroll.find({ month });
     const payrollsByMember = new Map(existingPayrolls.map((payroll) => [payroll.member.toString(), payroll]));
@@ -782,26 +795,12 @@ exports.calculateMonthlyPayroll = async (req, res) => {
 
     for (const member of members) {
       const mId = member._id.toString();
-      const att = attMap[mId] || { presentDays: 0, halfDays: 0, absentDays: 0, paidLeaveDays: 0, overtimeHours: 0 };
+      const att = attMap[mId] || emptyPayrollAttendance;
       const pendingAdvance = Math.max(0, round2((advancesByMember.get(mId) || 0) - (deductionsByMember.get(mId) || 0)));
 
-      // Calculate Gross Salary and Effective Days
-      let grossEarned = 0;
-      let effectivePresentDays = att.presentDays;
-
-      if (member.salaryType === 'Daily') {
-        // Daily: paid per present day
-        grossEarned = round2(att.presentDays * member.baseSalary);
-        effectivePresentDays = att.presentDays;
-      } else {
-        // Monthly Fixed Salary: ALWAYS full base salary.
-        // As requested: Only advances are deducted; leave/half-day deductions are done manually if needed.
-        grossEarned = member.baseSalary;
-        effectivePresentDays = Math.max(0, round2(daysInMonth - att.absentDays - (att.halfDays * 0.5)));
-      }
-
-      // Check if a payroll record already exists for this member and month
       let payroll = payrollsByMember.get(mId);
+      // Daily-rate staff need a gross salary entered in the payroll adjustment.
+      const grossEarned = payroll?.grossEarned ?? (member.salaryType === 'Daily' ? 0 : member.baseSalary);
 
       if (payroll && refreshAdvances) {
         const additionalDeduction = round2(Math.min(pendingAdvance, Math.max(0, payroll.balanceDue)));
@@ -837,7 +836,7 @@ exports.calculateMonthlyPayroll = async (req, res) => {
       if (payroll) {
         // Update attendance & gross, sync advance deduction
         payroll.totalDaysInMonth = daysInMonth;
-        payroll.presentDays = effectivePresentDays;
+        payroll.presentDays = att.presentDays;
         payroll.halfDays = att.halfDays;
         payroll.absentDays = att.absentDays;
         payroll.paidLeaveDays = att.paidLeaveDays;
@@ -874,7 +873,7 @@ exports.calculateMonthlyPayroll = async (req, res) => {
           salaryType: member.salaryType,
           baseSalary: member.baseSalary,
           totalDaysInMonth: daysInMonth,
-          presentDays: effectivePresentDays,
+          presentDays: att.presentDays,
           halfDays: att.halfDays,
           absentDays: att.absentDays,
           paidLeaveDays: att.paidLeaveDays,
@@ -1043,7 +1042,7 @@ exports.recordPayrollPayment = async (req, res) => {
 exports.getMonthlyStatement = async (req, res) => {
   try {
     const { month, memberId } = req.query; // 'YYYY-MM'
-    if (!month) {
+    if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(month)) {
       return res.status(400).json({ success: false, message: 'month parameter (YYYY-MM) is required' });
     }
 
@@ -1057,7 +1056,10 @@ exports.getMonthlyStatement = async (req, res) => {
     }
 
     const members = await TeamMember.find(memberFilter).sort({ name: 1 }).lean();
-    const payrolls = await Payroll.find({ month }).lean();
+    const [payrolls, attendance] = await Promise.all([
+      Payroll.find({ month }).lean(),
+      getPayrollAttendance(month)
+    ]);
     const payrollMap = {};
     payrolls.forEach(p => {
       payrollMap[p.member.toString()] = p;
@@ -1090,6 +1092,7 @@ exports.getMonthlyStatement = async (req, res) => {
     const statements = members.map(member => {
       const mId = member._id.toString();
       const payroll = payrollMap[mId] || null;
+      const recordedAttendance = attendance[mId] || emptyPayrollAttendance;
       const memberAdvances = advancesByMember[mId] || [];
       const totalMonthAdvances = memberAdvances.reduce((sum, a) => sum + (a.amount || 0), 0);
 
@@ -1107,9 +1110,9 @@ exports.getMonthlyStatement = async (req, res) => {
         advances: memberAdvances,
         totalMonthAdvances: round2(totalMonthAdvances),
         attendance: {
-          presentDays: payroll ? payroll.presentDays : 0,
-          halfDays: payroll ? payroll.halfDays : 0,
-          absentDays: payroll ? payroll.absentDays : 0,
+          presentDays: recordedAttendance.presentDays,
+          halfDays: recordedAttendance.halfDays,
+          absentDays: recordedAttendance.absentDays,
           totalDays: payroll ? payroll.totalDaysInMonth : getDaysInMonth(month)
         },
         salary: {
