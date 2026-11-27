@@ -81,6 +81,10 @@ const payrollSchema = new mongoose.Schema({
     type: Number,
     default: 0
   },
+  manualAdvanceDeduction: {
+    type: Boolean,
+    default: false
+  },
   otherDeductions: {
     type: Number,
     default: 0

@@ -30,6 +30,14 @@ const getDaysInMonth = (monthStr) => {
   return new Date(y, m, 0).getDate();
 };
 
+const monthBounds = (month) => {
+  const [year, monthNumber] = month.split('-').map(Number);
+  return {
+    start: new Date(`${month}-01T00:00:00+05:30`),
+    end: new Date(Date.UTC(year, monthNumber, 1) - 330 * 60 * 1000)
+  };
+};
+
 // ==========================================
 // 1. TEAM MEMBERS
 // ==========================================
@@ -471,7 +479,7 @@ exports.markSingleAttendance = async (req, res) => {
 // Get list of advances with filters
 exports.getAdvances = async (req, res) => {
   try {
-    const { memberId, status, from, to } = req.query;
+    const { memberId, status, from, to, month } = req.query;
     const filter = {};
 
     if (memberId && memberId !== 'All') {
@@ -480,7 +488,13 @@ exports.getAdvances = async (req, res) => {
     if (status && status !== 'All') {
       filter.status = status;
     }
-    if (from || to) {
+    if (month) {
+      if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(month)) {
+        return res.status(400).json({ success: false, message: 'Invalid month (YYYY-MM)' });
+      }
+      const { start, end } = monthBounds(month);
+      filter.advanceDate = { $gte: start, $lt: end };
+    } else if (from || to) {
       filter.advanceDate = {};
       if (from) filter.advanceDate.$gte = new Date(new Date(from).setHours(0, 0, 0, 0));
       if (to) filter.advanceDate.$lte = new Date(new Date(to).setHours(23, 59, 59, 999));
@@ -722,8 +736,8 @@ const syncMemberAdvanceDeductions = async (memberId) => {
 // Calculate or re-calculate payroll for all active members for a month
 exports.calculateMonthlyPayroll = async (req, res) => {
   try {
-    const { month } = req.body;
-    if (!month) {
+    const { month, refreshAdvances } = req.body;
+    if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(month)) {
       return res.status(400).json({ success: false, message: 'month is required (YYYY-MM)' });
     }
 
@@ -747,27 +761,29 @@ exports.calculateMonthlyPayroll = async (req, res) => {
       attMap[id].overtimeHours += (r.overtimeHours || 0);
     });
 
-    // Fetch pending advance balance per member (excluding deductions already in other months)
-    const openAdvances = await Advance.aggregate([
-      { $match: { status: { $in: ['Pending', 'Partially Deducted'] } } },
-      {
-        $group: {
-          _id: '$member',
-          totalPending: { $sum: { $subtract: ['$amount', '$amountDeducted'] } }
-        }
-      }
+    const existingPayrolls = await Payroll.find({ month });
+    const payrollsByMember = new Map(existingPayrolls.map((payroll) => [payroll.member.toString(), payroll]));
+
+    // Payroll deductions are the source for the balances mirrored onto advance entries.
+    const [advanceTotals, deductionTotals] = await Promise.all([
+      Advance.aggregate([
+        { $match: { advanceDate: { $lt: monthBounds(month).end } } },
+        { $group: { _id: '$member', total: { $sum: '$amount' } } }
+      ]),
+      Payroll.aggregate([
+        { $match: { advanceDeducted: { $gt: 0 } } },
+        { $group: { _id: '$member', total: { $sum: '$advanceDeducted' } } }
+      ])
     ]);
-    const advMap = {};
-    openAdvances.forEach(a => {
-      advMap[a._id.toString()] = round2(a.totalPending);
-    });
+    const advancesByMember = new Map(advanceTotals.map(({ _id, total }) => [_id.toString(), total]));
+    const deductionsByMember = new Map(deductionTotals.map(({ _id, total }) => [_id.toString(), total]));
 
     const results = [];
 
     for (const member of members) {
       const mId = member._id.toString();
       const att = attMap[mId] || { presentDays: 0, halfDays: 0, absentDays: 0, paidLeaveDays: 0, overtimeHours: 0 };
-      const pendingAdvance = advMap[mId] || 0;
+      const pendingAdvance = Math.max(0, round2((advancesByMember.get(mId) || 0) - (deductionsByMember.get(mId) || 0)));
 
       // Calculate Gross Salary and Effective Days
       let grossEarned = 0;
@@ -785,11 +801,32 @@ exports.calculateMonthlyPayroll = async (req, res) => {
       }
 
       // Check if a payroll record already exists for this member and month
-      let payroll = await Payroll.findOne({ member: member._id, month });
+      let payroll = payrollsByMember.get(mId);
+
+      if (payroll && refreshAdvances) {
+        const additionalDeduction = round2(Math.min(pendingAdvance, Math.max(0, payroll.balanceDue)));
+        if (!payroll.amountPaid && !payroll.manualAdvanceDeduction && additionalDeduction > 0) {
+          const updated = await Payroll.findOneAndUpdate(
+            { _id: payroll._id, updatedAt: payroll.updatedAt },
+            { $set: {
+              advanceDeducted: round2(payroll.advanceDeducted + additionalDeduction),
+              netPayable: round2(payroll.netPayable - additionalDeduction),
+              balanceDue: round2(payroll.balanceDue - additionalDeduction)
+            } },
+            { new: true }
+          );
+          if (updated) {
+            payroll = updated;
+            await syncMemberAdvanceDeductions(member._id);
+          }
+        }
+        results.push(payroll);
+        continue;
+      }
 
       // Automatically determine advance to deduct
       let advanceToDeduct = 0;
-      if (!payroll || payroll.amountPaid === 0) {
+      if (!payroll || (!payroll.amountPaid && !payroll.manualAdvanceDeduction)) {
         // When no salary payment has been made yet, automatically deduct pending advances!
         const totalAvailablePending = pendingAdvance + (payroll ? (payroll.advanceDeducted || 0) : 0);
         advanceToDeduct = Math.min(totalAvailablePending, grossEarned);
@@ -888,7 +925,10 @@ exports.updatePayrollAdjustment = async (req, res) => {
     }
     if (bonus !== undefined) payroll.bonus = round2(bonus);
     if (overtimePay !== undefined) payroll.overtimePay = round2(overtimePay);
-    if (advanceDeducted !== undefined) payroll.advanceDeducted = round2(advanceDeducted);
+    if (advanceDeducted !== undefined && round2(advanceDeducted) !== payroll.advanceDeducted) {
+      payroll.advanceDeducted = round2(advanceDeducted);
+      payroll.manualAdvanceDeduction = true;
+    }
     if (otherDeductions !== undefined) payroll.otherDeductions = round2(otherDeductions);
     if (notes !== undefined) payroll.notes = notes;
 
@@ -983,37 +1023,6 @@ exports.recordPayrollPayment = async (req, res) => {
       payroll.status = 'Paid';
     } else {
       payroll.status = 'Partial';
-    }
-
-    // Settle pending advances up to advanceDeducted
-    if (payroll.advanceDeducted > 0) {
-      let remainingToSettle = payroll.advanceDeducted;
-      const memberAdvances = await Advance.find({
-        member: payroll.member._id,
-        status: { $in: ['Pending', 'Partially Deducted'] }
-      }).sort({ advanceDate: 1 });
-
-      for (const adv of memberAdvances) {
-        if (remainingToSettle <= 0) break;
-        const advPending = round2(adv.amount - adv.amountDeducted);
-        const settleAmount = Math.min(advPending, remainingToSettle);
-
-        adv.amountDeducted = round2(adv.amountDeducted + settleAmount);
-        adv.deductedInPayrolls.push({
-          payroll: payroll._id,
-          amount: settleAmount,
-          date: new Date()
-        });
-
-        if (adv.amountDeducted >= adv.amount - 0.01) {
-          adv.status = 'Deducted';
-        } else {
-          adv.status = 'Partially Deducted';
-        }
-
-        await adv.save();
-        remainingToSettle = round2(remainingToSettle - settleAmount);
-      }
     }
 
     await payroll.save();
